@@ -8,6 +8,7 @@ package badger
 import (
 	"bytes"
 	"context"
+	"io"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -98,6 +99,18 @@ type Stream struct {
 	doneMarkers  bool
 	scanned      atomic.Uint64 // used to estimate the ETA for data scan.
 	numProducers atomic.Int32
+
+	// backupPlanOverride, when set, makes the Stream iterate exactly these key
+	// ranges instead of computing ranges from the current table layout. Every
+	// range carries a stable slot ordinal that is also used as the stream id,
+	// which lets an interrupted envelope backup resume independently of how the
+	// ranges get scheduled across goroutines. Used only by Stream.Backup.
+	backupPlanOverride []*keyRange
+
+	// resumeWriteWrap wraps the writer used for the continuation phase of a
+	// resumable backup. It is intended for tests that interrupt the resume
+	// itself; nil otherwise.
+	resumeWriteWrap func(io.Writer) io.Writer
 }
 
 // SendDoneMarkers when true would send out done markers on the stream. False by default.
@@ -151,10 +164,17 @@ func (st *Stream) ToList(key []byte, itr *Iterator) (*pb.KVList, error) {
 // keyRange is [start, end), including start, excluding end. Do ensure that the start,
 // end byte slices are owned by keyRange struct.
 func (st *Stream) produceRanges(ctx context.Context) {
-	ranges := st.db.Ranges(st.Prefix, st.NumGo)
+	var ranges []*keyRange
+	if st.backupPlanOverride != nil {
+		// Backup path: iterate the exact planned slots so that chunk identity is
+		// stable across a backup and its resume.
+		ranges = st.backupPlanOverride
+	} else {
+		ranges = st.db.Ranges(st.Prefix, st.NumGo)
+		y.AssertTrue(ranges[0].left == nil)
+		y.AssertTrue(ranges[len(ranges)-1].right == nil)
+	}
 	y.AssertTrue(len(ranges) > 0)
-	y.AssertTrue(ranges[0].left == nil)
-	y.AssertTrue(ranges[len(ranges)-1].right == nil)
 	st.db.opt.Infof("Number of ranges found: %d\n", len(ranges))
 
 	// Sort in descending order of size.
@@ -203,8 +223,16 @@ func (st *Stream) produceKVs(ctx context.Context, threadId int) error {
 		itr.Alloc = z.NewAllocator(1<<20, "Stream.Iterate")
 		defer itr.Alloc.Release()
 
-		// This unique stream id is used to identify all the keys from this iteration.
-		streamId := st.nextStreamId.Add(1)
+		// The stream id identifies all keys coming from this iteration. On the
+		// backup path it is the planned slot ordinal (plus one, so 0 stays
+		// unassigned); that identity is part of the envelope and must be stable
+		// between an interrupted backup and its resume.
+		var streamId uint32
+		if st.backupPlanOverride != nil {
+			streamId = kr.slot + 1
+		} else {
+			streamId = st.nextStreamId.Add(1)
+		}
 		var scanned int
 
 		sendIt := func() error {

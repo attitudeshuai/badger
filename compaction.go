@@ -21,6 +21,11 @@ type keyRange struct {
 	right []byte
 	inf   bool
 	size  int64 // size is used for Key splits.
+
+	// slot is the ordinal of this range in a backup's key-range plan. It is only
+	// set when a Stream runs with a backup plan (Stream.backupPlanOverride) and
+	// is used as the stable chunk/slot identity while writing an envelope.
+	slot uint32
 }
 
 func (r keyRange) isEmpty() bool {
