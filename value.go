@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -702,6 +703,9 @@ type request struct {
 	Wg   sync.WaitGroup
 	Err  error
 	ref  atomic.Int32
+	// enqueuedAt is set when the request enters db.writeCh; it measures the
+	// end-to-end user write latency (queue + service) when it completes.
+	enqueuedAt time.Time
 }
 
 func (req *request) reset() {
@@ -710,6 +714,7 @@ func (req *request) reset() {
 	req.Wg = sync.WaitGroup{}
 	req.Err = nil
 	req.ref.Store(0)
+	req.enqueuedAt = time.Time{}
 }
 
 func (req *request) IncrRef() {
@@ -918,8 +923,8 @@ func (vlog *valueLog) write(reqs []*request) error {
 			bytesWritten += buf.Len()
 			// No need to flush anything, we write to file directly via mmap.
 		}
-		y.NumWritesVlogAdd(vlog.opt.MetricsEnabled, int64(written))
-		y.NumBytesWrittenVlogAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
+		vlog.db.metrics.NumWritesVlogAdd(int64(written))
+		vlog.db.metrics.NumBytesWrittenVlogAdd(int64(bytesWritten))
 
 		vlog.numEntriesWritten += uint32(written)
 		vlog.db.threshold.update(valueSizes)
@@ -1018,9 +1023,11 @@ func (vlog *valueLog) readValueBytes(vp valuePointer) ([]byte, *logFile, error) 
 		return nil, nil, err
 	}
 
+	start := time.Now()
 	buf, err := lf.read(vp)
-	y.NumReadsVlogAdd(vlog.db.opt.MetricsEnabled, 1)
-	y.NumBytesReadsVlogAdd(vlog.db.opt.MetricsEnabled, int64(len(buf)))
+	vlog.db.metrics.ObserveVlogRead(time.Since(start))
+	vlog.db.metrics.NumReadsVlogAdd(1)
+	vlog.db.metrics.NumBytesReadsVlogAdd(int64(len(buf)))
 	return buf, lf, err
 }
 
@@ -1117,7 +1124,13 @@ func (vlog *valueLog) runGC(discardRatio float64) error {
 		if lf == nil {
 			return ErrNoRewrite
 		}
-		return vlog.doRunGC(lf)
+		// Only actual reclamation attempts (a file was picked and rewritten)
+		// are sampled; ErrNoRewrite/ErrRejected non-events would otherwise
+		// pollute the distribution with cheap no-ops.
+		start := time.Now()
+		err := vlog.doRunGC(lf)
+		vlog.db.metrics.ObserveVlogGC(time.Since(start))
+		return err
 	default:
 		return ErrRejected
 	}

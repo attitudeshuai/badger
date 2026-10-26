@@ -939,8 +939,8 @@ func (s *levelsController) compactBuildTables(
 	botTables := cd.bot
 
 	numTables := int64(len(topTables) + len(botTables))
-	y.NumCompactionTablesAdd(s.kv.opt.MetricsEnabled, numTables)
-	defer y.NumCompactionTablesAdd(s.kv.opt.MetricsEnabled, -numTables)
+	s.kv.metrics.NumCompactionTablesAdd(numTables)
+	defer s.kv.metrics.NumCompactionTablesAdd(-numTables)
 
 	keepTable := func(t *table.Table) bool {
 		for _, prefix := range cd.dropPrefixes {
@@ -1495,6 +1495,10 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 	}
 
 	timeStart := time.Now()
+	// Every real compaction (background compactors, CompactL0OnClose and
+	// Flatten-driven ones all funnel through runCompactDef) contributes one
+	// sample to the compaction latency distribution of this DB instance.
+	defer func() { s.kv.metrics.ObserveCompaction(time.Since(timeStart)) }()
 
 	thisLevel := cd.thisLevel
 	nextLevel := cd.nextLevel
@@ -1539,10 +1543,10 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 
 	sizeNewTables := int64(0)
 	sizeOldTables := int64(0)
-	if s.kv.opt.MetricsEnabled {
+	if s.kv.metrics != nil {
 		sizeNewTables = getSizes(newTables)
 		sizeOldTables = getSizes(cd.bot) + getSizes(cd.top)
-		y.NumBytesCompactionWrittenAdd(s.kv.opt.MetricsEnabled, nextLevel.strLevel, sizeNewTables)
+		s.kv.metrics.NumBytesCompactionWrittenAdd(nextLevel.strLevel, sizeNewTables)
 	}
 
 	// See comment earlier in this function about the ordering of these ops, and the order in which
@@ -1741,7 +1745,7 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		if vs.Value == nil && vs.Meta == 0 {
 			continue
 		}
-		y.NumBytesReadsLSMAdd(s.kv.opt.MetricsEnabled, int64(len(vs.Value)))
+		s.kv.metrics.NumBytesReadsLSMAdd(int64(len(vs.Value)))
 		if vs.Version == version {
 			return vs, nil
 		}
@@ -1750,7 +1754,7 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		}
 	}
 	if len(maxVs.Value) > 0 {
-		y.NumGetsWithResultsAdd(s.kv.opt.MetricsEnabled, 1)
+		s.kv.metrics.NumGetsWithResultsAdd(1)
 	}
 	return maxVs, nil
 }

@@ -183,7 +183,7 @@ func buildTableOptions(db *DB) table.Options {
 	y.Check(err)
 	return table.Options{
 		ReadOnly:             opt.ReadOnly,
-		MetricsEnabled:       db.opt.MetricsEnabled,
+		Metrics:              db.metrics,
 		TableSize:            uint64(opt.BaseTableSize),
 		BlockSize:            opt.BlockSize,
 		BloomFalsePositive:   opt.BloomFalsePositive,

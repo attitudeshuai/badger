@@ -10,7 +10,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"expvar"
 	"fmt"
 	"math"
 	"os"
@@ -134,6 +133,11 @@ type DB struct {
 	blockCache *ristretto.Cache[[]byte, *table.Block]
 	indexCache *ristretto.Cache[uint64, *fb.TableIndex]
 	allocPool  *z.AllocatorPool
+
+	// metrics is the per-DB-instance metric plane. It is nil when
+	// Options.MetricsEnabled is false; every *y.Metrics method is nil-safe so
+	// call sites pay nothing beyond the (predicted) nil check.
+	metrics *y.Metrics
 }
 
 const (
@@ -265,6 +269,14 @@ func Open(opt Options) (*DB, error) {
 
 	db.flushCond = sync.NewCond(&db.lock)
 	db.syncChan = opt.syncChan
+
+	// Register the per-instance metric plane before any goroutine or open
+	// path can start reporting. When metrics are disabled the handle stays
+	// nil and every reporting call site is a no-op. The registration is
+	// released by close() (or cleanup() if Open fails below).
+	if opt.MetricsEnabled {
+		db.metrics = y.NewMetrics(opt.Dir, opt.ValueDir)
+	}
 
 	// Cleanup all the goroutines started by badger in case of an error.
 	defer func() {
@@ -498,7 +510,9 @@ func (db *DB) cleanup() {
 	db.blockCache.Close()
 	db.indexCache.Close()
 	if db.closers.updateSize != nil {
-		db.closers.updateSize.Signal()
+		// Wait (not just signal) so a late calculateSize tick cannot publish
+		// the per-instance gauges after metrics.Close releases them.
+		db.closers.updateSize.SignalAndWait()
 	}
 	if db.closers.valueGC != nil {
 		db.closers.valueGC.Signal()
@@ -511,6 +525,10 @@ func (db *DB) cleanup() {
 	}
 
 	db.orc.Stop()
+
+	// All metric-producing goroutines are stopped; release the instance's
+	// registry entry and legacy gauge slots.
+	db.metrics.Close()
 
 	// Do not use vlog.Close() here. vlog.Close truncates the files. We don't
 	// want to truncate files unless the user has specified the truncate flag.
@@ -654,6 +672,11 @@ func (db *DB) close() (err error) {
 	db.opt.Debugf("Waiting for closer")
 	db.closers.updateSize.SignalAndWait()
 	db.orc.Stop()
+	// Every metric producer (writes, vlog GC, flush, compactors, size
+	// updater) is stopped now; release this instance's registry entry and
+	// its legacy directory-keyed gauge slots. This must precede the InMemory
+	// early return below.
+	db.metrics.Close()
 	db.blockCache.Close()
 	db.indexCache.Close()
 
@@ -696,7 +719,10 @@ func (db *DB) close() (err error) {
 // VerifyChecksum verifies checksum for all tables on all levels.
 // This method can be used to verify checksum, if opt.ChecksumVerificationMode is NoVerification.
 func (db *DB) VerifyChecksum() error {
-	return db.lc.verifyChecksum()
+	start := time.Now()
+	err := db.lc.verifyChecksum()
+	db.metrics.ObserveDiagnostic(y.DiagnosticVerifyChecksum, time.Since(start))
+	return err
 }
 
 const (
@@ -790,22 +816,25 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
 	if db.IsClosed() {
 		return y.ValueStruct{}, ErrDBClosed
 	}
+	start := time.Now()
+	defer func() { db.metrics.ObserveGet(time.Since(start)) }()
+
 	tables, decr := db.getMemTables() // Lock should be released.
 	defer decr()
 
 	var maxVs y.ValueStruct
 	version := y.ParseTs(key)
 
-	y.NumGetsAdd(db.opt.MetricsEnabled, 1)
+	db.metrics.NumGetsAdd(1)
 	for i := 0; i < len(tables); i++ {
 		vs := tables[i].sl.Get(key)
-		y.NumMemtableGetsAdd(db.opt.MetricsEnabled, 1)
+		db.metrics.NumMemtableGetsAdd(1)
 		if vs.Meta == 0 && vs.Value == nil {
 			continue
 		}
 		// Found the required version of the key, return immediately.
 		if vs.Version == version {
-			y.NumGetsWithResultsAdd(db.opt.MetricsEnabled, 1)
+			db.metrics.NumGetsWithResultsAdd(1)
 			return vs, nil
 		}
 		if maxVs.Version < vs.Version {
@@ -873,6 +902,9 @@ func (db *DB) writeRequests(reqs []*request) error {
 	done := func(err error) {
 		for _, r := range reqs {
 			r.Err = err
+			if !r.enqueuedAt.IsZero() {
+				db.metrics.ObservePut(time.Since(r.enqueuedAt))
+			}
 			r.Wg.Done()
 		}
 	}
@@ -922,7 +954,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
 		count++
 	}
-	y.NumBytesWrittenUserAdd(db.opt.MetricsEnabled, size)
+	db.metrics.NumBytesWrittenUserAdd(size)
 	if count >= db.opt.maxBatchCount || size >= db.opt.maxBatchSize {
 		return nil, ErrTxnTooBig
 	}
@@ -933,9 +965,10 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req.reset()
 	req.Entries = entries
 	req.Wg.Add(1)
-	req.IncrRef()     // for db write
+	req.IncrRef() // for db write
+	req.enqueuedAt = time.Now()
 	db.writeCh <- req // Handled in doWrites.
-	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
+	db.metrics.NumPutsAdd(int64(len(entries)))
 
 	return req, nil
 }
@@ -952,8 +985,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 	}
 
 	// This variable tracks the number of pending writes.
-	reqLen := new(expvar.Int)
-	y.PendingWritesSet(db.opt.MetricsEnabled, db.opt.Dir, reqLen)
+	reqLen := new(int64)
 
 	reqs := make([]*request, 0, 10)
 	for {
@@ -966,7 +998,8 @@ func (db *DB) doWrites(lc *z.Closer) {
 
 		for {
 			reqs = append(reqs, r)
-			reqLen.Set(int64(len(reqs)))
+			*reqLen = int64(len(reqs))
+			db.metrics.PendingWritesSet(*reqLen)
 
 			if len(reqs) >= 3*kvWriteChCapacity {
 				pendingCh <- struct{}{} // blocking.
@@ -1000,7 +1033,8 @@ func (db *DB) doWrites(lc *z.Closer) {
 	writeCase:
 		go writeRequests(reqs)
 		reqs = make([]*request, 0, 10)
-		reqLen.Set(0)
+		*reqLen = 0
+		db.metrics.PendingWritesSet(0)
 	}
 }
 
@@ -1198,15 +1232,15 @@ func exists(path string) (bool, error) {
 }
 
 // This function does a filewalk, calculates the size of vlog and sst files and stores it in
-// y.LSMSize and y.VlogSize.
+// the per-instance metrics plane (and the legacy expvar gauges).
 func (db *DB) calculateSize() {
 	if db.opt.InMemory {
 		return
 	}
-	newInt := func(val int64) *expvar.Int {
-		v := new(expvar.Int)
-		v.Add(val)
-		return v
+	// Metrics are disabled: Size() reports zero in this mode, so skip the
+	// directory walk entirely.
+	if db.metrics == nil {
+		return
 	}
 
 	totalSize := func(dir string) (int64, int64) {
@@ -1231,12 +1265,12 @@ func (db *DB) calculateSize() {
 	}
 
 	lsmSize, vlogSize := totalSize(db.opt.Dir)
-	y.LSMSizeSet(db.opt.MetricsEnabled, db.opt.Dir, newInt(lsmSize))
+	db.metrics.LSMSizeSet(lsmSize)
 	// If valueDir is different from dir, we'd have to do another walk.
 	if db.opt.ValueDir != db.opt.Dir {
 		_, vlogSize = totalSize(db.opt.ValueDir)
 	}
-	y.VlogSizeSet(db.opt.MetricsEnabled, db.opt.ValueDir, newInt(vlogSize))
+	db.metrics.VlogSizeSet(vlogSize)
 }
 
 func (db *DB) updateSize(lc *z.Closer) {
@@ -1319,13 +1353,22 @@ func (db *DB) RunValueLogGC(discardRatio float64) error {
 // Size returns the size of lsm and value log files in bytes. It can be used to decide how often to
 // call RunValueLogGC.
 func (db *DB) Size() (lsm, vlog int64) {
-	if y.LSMSizeGet(db.opt.MetricsEnabled, db.opt.Dir) == nil {
-		lsm, vlog = 0, 0
-		return
+	if db.metrics == nil {
+		// Preserve the historical behavior: when metrics are disabled the
+		// sizes are not tracked and report zero.
+		return 0, 0
 	}
-	lsm = y.LSMSizeGet(db.opt.MetricsEnabled, db.opt.Dir).(*expvar.Int).Value()
-	vlog = y.VlogSizeGet(db.opt.MetricsEnabled, db.opt.ValueDir).(*expvar.Int).Value()
+	lsm, _ = db.metrics.LSMSize()
+	vlog, _ = db.metrics.VlogSize()
 	return
+}
+
+// Metrics returns the per-instance metric plane for this DB. It returns nil
+// when Options.MetricsEnabled is false. Use (*y.Metrics).Snapshot for a
+// consistent point-in-time reading, and y.AllMetricsSnapshots to snapshot
+// every open DB instance in the process at once.
+func (db *DB) Metrics() *y.Metrics {
+	return db.metrics
 }
 
 // Sequence represents a Badger sequence.
@@ -1664,6 +1707,9 @@ func (db *DB) Flatten(workers int) error {
 	if db.opt.ReadOnly {
 		panic("Cannot flatten in read-only mode.")
 	}
+
+	start := time.Now()
+	defer func() { db.metrics.ObserveDiagnostic(y.DiagnosticFlatten, time.Since(start)) }()
 
 	db.stopCompactions()
 	defer db.startCompactions()

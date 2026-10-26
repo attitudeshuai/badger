@@ -313,14 +313,14 @@ func (s *levelHandler) get(key []byte) (y.ValueStruct, error) {
 	var maxVs y.ValueStruct
 	for _, th := range tables {
 		if th.DoesNotHave(hash) {
-			y.NumLSMBloomHitsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
+			s.db.metrics.NumLSMBloomHitsAdd(s.strLevel, 1)
 			continue
 		}
 
 		it := th.NewIterator(0)
 		defer it.Close()
 
-		y.NumLSMGetsAdd(s.db.opt.MetricsEnabled, s.strLevel, 1)
+		s.db.metrics.NumLSMGetsAdd(s.strLevel, 1)
 		it.Seek(key)
 		if !it.Valid() {
 			continue

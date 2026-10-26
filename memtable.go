@@ -38,6 +38,9 @@ type memTable struct {
 	maxVersion uint64
 	opt        Options
 	buf        *bytes.Buffer
+	// metrics is the owning DB's per-instance metric plane (nil when
+	// metrics are disabled).
+	metrics *y.Metrics
 }
 
 func (db *DB) openMemTables(opt Options) error {
@@ -98,9 +101,10 @@ func (db *DB) openMemTable(fid, flags int) (*memTable, error) {
 	filepath := db.mtFilePath(fid)
 	s := skl.NewSkiplist(arenaSize(db.opt))
 	mt := &memTable{
-		sl:  s,
-		opt: db.opt,
-		buf: &bytes.Buffer{},
+		sl:      s,
+		opt:     db.opt,
+		buf:     &bytes.Buffer{},
+		metrics: db.metrics,
 	}
 	// We don't need to create the wal for the skiplist in in-memory mode so return the mt.
 	if db.opt.InMemory {
@@ -194,7 +198,7 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 	if ts := y.ParseTs(entry.Key); ts > mt.maxVersion {
 		mt.maxVersion = ts
 	}
-	y.NumBytesWrittenToL0Add(mt.opt.MetricsEnabled, entry.estimateSizeAndSetThreshold(mt.opt.ValueThreshold))
+	mt.metrics.NumBytesWrittenToL0Add(entry.estimateSizeAndSetThreshold(mt.opt.ValueThreshold))
 	return nil
 }
 
