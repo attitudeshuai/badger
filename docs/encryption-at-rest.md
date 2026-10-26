@@ -62,17 +62,53 @@ consume 32KB. At 10-day intervals, this represents approximately 27 years of key
 
 ### Master Key Rotation
 
-Users must manually rotate master keys. Use the `rotate` command:
+Two modes are supported.
+
+#### Online key rotation (recommended)
+
+Call `DB.StartKeyRotation(newKey)` on a running database. Badger then:
+
+1. Generates a new data key generation and atomically re-wraps the key registry with the
+   new master key (fsynced before any file uses the new data key).
+2. Seals the active value log and memtable WAL, so every subsequent transaction write
+   lands in a file created under the new generation.
+3. Rewrites the existing SSTables and value log files in background batches, online,
+   without blocking reads or writes. Each file switch is a single atomic MANIFEST
+   changeset; iterators pin old files until they finish.
+
+While the rotation runs, compaction, memtable flushes, value log GC and offline tools
+(`flatten`, `restore`) all produce files under the same pinned key generation. Time based
+data key rotation is suspended for the duration, so a second generation can never appear
+mid-rotation.
+
+Progress is queryable via `DB.KeyRotationStatus()` and awaitable via
+`DB.WaitKeyRotation(ctx)`. The progress checkpoint (`KEYROTATION`) is fsynced before
+rewriting starts: if the process exits mid-rotation, reopening the directory with the new
+master key automatically resumes from that checkpoint. Whether a file still needs
+rewriting is derived from the MANIFEST KeyID (SSTables), the vlog header and the WAL
+header, so completed files are never rewritten twice.
+
+Old data key generations are removed from the registry only after the last old-generation
+file has been rewritten; until then every old file stays readable. The directory lock
+still prevents two instances from writing the same directory concurrently.
+
+#### Offline registry re-wrap
+
+The original offline tool only re-encrypts the data keys in the key registry; on-disk
+data keeps using its existing data keys until ordinary compaction rewrites it:
 
 ```shell
 badger rotate --dir=badger_dir --old-key-path=old/path --new-key-path=new/path
 ```
 
-**Requirements:**
+`badger rotate --rewrite` instead opens the database with the old key and drives the
+online rotation described above to completion from the command line (the database must not
+be open elsewhere).
+
+**Requirements for the registry-only mode:**
 
 - Database must be offline during master key rotation
 - Only data keys are re-encrypted (fast operation)
-- Future versions may support online rotation
 
 ## Initialization Vectors
 

@@ -114,4 +114,16 @@ var (
 
 	// ErrDBClosed is returned when a get operation is performed after closing the DB.
 	ErrDBClosed = stderrors.New("DB Closed")
+
+	// ErrKeyRotationInProgress is returned when StartKeyRotation is called while a
+	// key rotation is already running.
+	ErrKeyRotationInProgress = stderrors.New("Key rotation is already in progress")
+
+	// ErrKeyRotationInMemory is returned when StartKeyRotation is called on a DB
+	// opened in InMemory mode, where no on-disk files exist to rewrite.
+	ErrKeyRotationInMemory = stderrors.New("Key rotation is not supported in InMemory mode")
+
+	// ErrKeyRotationReadOnly is returned when StartKeyRotation is called on a DB
+	// opened in read-only mode.
+	ErrKeyRotationReadOnly = stderrors.New("Key rotation is not supported in read-only mode")
 )

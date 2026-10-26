@@ -171,6 +171,55 @@ func (s *levelHandler) sortTables() {
 	})
 }
 
+// rotationReplaceTable is used by online key rotation to atomically swap one
+// table with one or more tables re-encrypted under the new data key
+// generation, keeping the table on the SAME level. The MANIFEST changeset
+// (create new, delete old) must already have been fsynced before this is
+// called, mirroring the ordering in runCompactDef.
+//
+// Readers are never blocked: old is removed from the level and its level
+// reference dropped here, while iterators that pinned the table keep it alive
+// via their own references until they release it (the physical file is
+// deleted only at that point).
+//
+// Level 0 is ordered by time (newest at the back), not key range, so the
+// replacement tables are appended at the back: they hold the same data as
+// the table they replace and must take precedence over older L0 tables.
+// Other levels are re-sorted by Smallest, like replaceTables.
+func (s *levelHandler) rotationReplaceTable(old *table.Table, newTables []*table.Table) error {
+	s.Lock()
+
+	out := make([]*table.Table, 0, len(s.tables)+len(newTables))
+	for _, t := range s.tables {
+		if t.ID() == old.ID() {
+			s.subtractSize(t)
+			continue
+		}
+		out = append(out, t)
+	}
+	for _, nt := range newTables {
+		s.addSize(nt)
+		nt.IncrRef() // The level now holds a reference on the new table.
+		out = append(out, nt)
+	}
+	s.tables = out
+	if s.level != 0 {
+		sort.Slice(s.tables, func(i, j int) bool {
+			return y.CompareKeys(s.tables[i].Smallest(), s.tables[j].Smallest()) < 0
+		})
+	}
+
+	s.Unlock() // Unlock before DecrRef, which can be slow.
+	if err := old.DecrRef(); err != nil {
+		return err
+	}
+	if s.level == 0 {
+		// The L0 table count may have changed, wake a stalled flush goroutine.
+		s.signalL0Drained()
+	}
+	return nil
+}
+
 func decrRefs(tables []*table.Table) error {
 	for _, table := range tables {
 		if err := table.DecrRef(); err != nil {

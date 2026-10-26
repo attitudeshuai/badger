@@ -1899,3 +1899,202 @@ func (s *levelsController) keySplits(numPerTable int, prefix []byte) []string {
 	sort.Strings(splits)
 	return splits
 }
+
+// rotateEncryptionBatch rewrites up to batchSize SSTables that are still
+// encrypted under a data key generation older than targetKeyID, producing new
+// tables encrypted (or left in plain text when targetKeyID is 0) under the
+// target generation. Tables are processed from the last level upwards so
+// naturally churning L0 tables are left for last (ordinary compaction often
+// rewrites them first).
+//
+// Each table is rewritten independently, on the same level, and the old->new
+// switch is committed with a single atomic MANIFEST changeset (create new
+// tables + delete old table) followed by the in-memory level swap, exactly
+// like compaction. Progress therefore needs no separate checkpoint: on
+// restart the MANIFEST KeyID of every live table tells whether it still needs
+// rewriting, so already finished tables are never rewritten again.
+//
+// A table currently owned by a compaction is skipped for this batch; the
+// compaction output already uses the pinned target generation, so the next
+// status scan will not find it.
+//
+// Returns the number of tables actually rewritten.
+func (s *levelsController) rotateEncryptionBatch(batchSize int, targetKeyID uint64) (int, error) {
+	rewritten := 0
+	for l := len(s.levels) - 1; l >= 0 && rewritten < batchSize; l-- {
+		lh := s.levels[l]
+		lh.RLock()
+		candidates := make([]*table.Table, len(lh.tables))
+		copy(candidates, lh.tables)
+		lh.RUnlock()
+
+		for _, t := range candidates {
+			if rewritten >= batchSize {
+				break
+			}
+			// Tables are immutable: their key id never changes. New tables
+			// produced by compaction/flush while rotation runs carry the
+			// pinned target generation.
+			if t.KeyID() == targetKeyID {
+				continue
+			}
+			ok, err := s.rotateRewriteTable(lh, t, targetKeyID)
+			if err != nil {
+				return rewritten, err
+			}
+			if ok {
+				rewritten++
+			}
+		}
+	}
+	return rewritten, nil
+}
+
+// rotateEncryptionRemaining counts SSTables still encrypted under a
+// generation other than targetKeyID.
+func (s *levelsController) rotateEncryptionRemaining(targetKeyID uint64) (total, remaining int) {
+	for _, l := range s.levels {
+		l.RLock()
+		for _, t := range l.tables {
+			total++
+			if t.KeyID() != targetKeyID {
+				remaining++
+			}
+		}
+		l.RUnlock()
+	}
+	return total, remaining
+}
+
+// rotateRewriteTable re-encrypts one table in place at its level. It returns
+// false (and does nothing) when the table is currently involved in another
+// compaction.
+func (s *levelsController) rotateRewriteTable(
+	lh *levelHandler, t *table.Table, targetKeyID uint64) (bool, error) {
+	// Keep the table alive and on disk for the whole operation, independently
+	// of the level reference and of concurrent iterators.
+	t.IncrRef()
+	defer func() {
+		if err := t.DecrRef(); err != nil {
+			s.kv.opt.Errorf("while releasing rotation scan ref on table %d: %v", t.ID(), err)
+		}
+	}()
+
+	// Register the key range with the same compactStatus mechanism compaction
+	// uses, for both this and the next level set to the table's own level. Any
+	// overlapping compaction then waits until we are done, and vice versa.
+	tRange := getKeyRange(t)
+	cd := compactDef{
+		thisLevel: lh,
+		nextLevel: lh,
+		top:       nil,
+		bot:       []*table.Table{t},
+		thisRange: tRange,
+		nextRange: tRange,
+		t:         s.levelTargets(),
+	}
+	if !s.cstatus.compareAndAdd(thisAndNextLevelRLocked{}, cd) {
+		// A compaction owns this range. Its output uses the pinned target
+		// generation, so nothing is lost by skipping the table here.
+		return false, nil
+	}
+	defer s.cstatus.delete(cd)
+
+	// Build options with the target data key explicitly. DataKey is nil for a
+	// plain-text target, which makes the builder write an unencrypted table.
+	dk, err := s.kv.registry.DataKey(targetKeyID)
+	if err != nil {
+		return false, y.Wrapf(err, "while retrieving target data key %d", targetKeyID)
+	}
+	bopts := buildTableOptions(s.kv)
+	bopts.DataKey = dk
+	// Use the same output table size a normal compaction into this level would,
+	// so the rewritten files blend in with ordinary compaction output.
+	bopts.TableSize = uint64(cd.t.fileSz[lh.level])
+
+	it := t.NewIterator(table.NOCACHE)
+	defer it.Close()
+
+	// Build-time references on every table we create. Before the MANIFEST
+	// changeset is committed these are the only references, so dropping them on
+	// an error removes the partial files. After the swap the level holds its
+	// own references, so dropping ours leaves the tables in place.
+	var newTables []*table.Table
+	defer func() {
+		if err := decrRefs(newTables); err != nil {
+			s.kv.opt.Errorf("while releasing build refs during key rotation: %v", err)
+		}
+	}()
+	for it.Rewind(); it.Valid(); {
+		builder := table.NewTableBuilder(bopts)
+		// Copy every entry verbatim, keeping all versions and value pointers
+		// exactly as stored. Rotation must not change data semantics.
+		for it.Valid() {
+			vs := it.Value()
+			var vp valuePointer
+			if vs.Meta&bitValuePointer > 0 {
+				vp.Decode(vs.Value)
+			}
+			builder.Add(it.Key(), vs, vp.Len)
+			it.Next()
+			if builder.ReachedCapacity() {
+				break
+			}
+		}
+		if builder.Empty() {
+			builder.Finish()
+			builder.Close()
+			continue
+		}
+		fileID := s.reserveFileID()
+		fname := table.NewFilename(fileID, s.kv.opt.Dir)
+		newTable, err := table.CreateTable(fname, builder)
+		builder.Close()
+		if err != nil {
+			return false, y.Wrapf(err, "while creating rewritten table for %d", t.ID())
+		}
+		if newTable.KeyID() != targetKeyID {
+			return false, fmt.Errorf("rewritten table %d uses key id %d, expected target %d",
+				fileID, newTable.KeyID(), targetKeyID)
+		}
+		newTables = append(newTables, newTable)
+	}
+	if len(newTables) == 0 {
+		// An SSTable always contains at least one block; this is defensive.
+		return false, fmt.Errorf("table %d rewrote to no tables", t.ID())
+	}
+
+	// Atomically publish the new tables and retire the old one in the
+	// MANIFEST before touching the in-memory level state. If we crash right
+	// after this append, reopen reconstructs the new layout; an orphaned old
+	// file is removed by revertToManifest, and an orphaned new file (crash
+	// before the append) is removed the same way.
+	changes := make([]*pb.ManifestChange, 0, len(newTables)+1)
+	for _, nt := range newTables {
+		changes = append(changes,
+			newCreateChange(nt.ID(), lh.level, nt.KeyID(), nt.CompressionType()))
+	}
+	changes = append(changes, newDeleteChange(t.ID()))
+	if err := s.kv.manifest.addChanges(changes, s.kv.opt); err != nil {
+		return false, y.Wrapf(err, "while publishing rotation rewrite of table %d", t.ID())
+	}
+	// Ensure the newly created files' directory entries are durable now that
+	// the MANIFEST references them (same ordering as compactBuildTables). A
+	// failure here is best-effort: the file contents are msynced and the
+	// committed MANIFEST already references them, so the swap must still
+	// happen to keep the in-memory state consistent with disk.
+	if err := s.kv.syncDir(s.kv.opt.Dir); err != nil {
+		s.kv.opt.Warningf("while syncing dir after rotation rewrite of table %d: %v",
+			t.ID(), err)
+	}
+
+	// Swap in memory. This drops the level's reference on the old table; its
+	// file is deleted once all in-flight iterators release it. Reads are
+	// unaffected because the new tables are available immediately.
+	if err := lh.rotationReplaceTable(t, newTables); err != nil {
+		return false, y.Wrapf(err, "while swapping table %d during rotation", t.ID())
+	}
+	s.kv.opt.Debugf("Key rotation rewrote SST %d -> %d table(s) at level %d under key %d\n",
+		t.ID(), len(newTables), lh.level, targetKeyID)
+	return true, nil
+}

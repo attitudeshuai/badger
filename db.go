@@ -47,6 +47,7 @@ type closers struct {
 	valueGC     *z.Closer
 	pub         *z.Closer
 	cacheHealth *z.Closer
+	keyRotation *z.Closer
 }
 
 type lockedKeys struct {
@@ -129,11 +130,14 @@ type DB struct {
 	bannedNamespaces *lockedKeys
 	threshold        *vlogThreshold
 
-	pub        *publisher
-	registry   *KeyRegistry
-	blockCache *ristretto.Cache[[]byte, *table.Block]
-	indexCache *ristretto.Cache[uint64, *fb.TableIndex]
-	allocPool  *z.AllocatorPool
+	pub      *publisher
+	registry *KeyRegistry
+	// keyRotation is non-nil while a key rotation is active or after one has
+	// completed during this process. nil when no rotation was ever started.
+	keyRotation *keyRotationRunner
+	blockCache  *ristretto.Cache[[]byte, *table.Block]
+	indexCache  *ristretto.Cache[uint64, *fb.TableIndex]
+	allocPool   *z.AllocatorPool
 }
 
 const (
@@ -337,6 +341,13 @@ func Open(opt Options) (*DB, error) {
 	if db.registry, err = OpenKeyRegistry(krOpt); err != nil {
 		return db, err
 	}
+	// Resume an interrupted online key rotation before any new file is
+	// created during Open: this pins the target generation so memtable replay
+	// flushes and the fresh value log all use it. The background worker is
+	// started once every subsystem is up.
+	if err = db.resumeKeyRotationIfNeeded(); err != nil {
+		return db, err
+	}
 	db.calculateSize()
 	db.closers.updateSize = z.NewCloser(1)
 	go db.updateSize(db.closers.updateSize)
@@ -401,6 +412,11 @@ func Open(opt Options) (*DB, error) {
 		db.closers.valueGC = z.NewCloser(1)
 		go db.vlog.waitOnGC(db.closers.valueGC)
 	}
+
+	// If a KEYROTATION checkpoint was found earlier, start rewriting the
+	// remaining old-generation files now that the full write/compaction/GC
+	// machinery is running.
+	db.startResumedKeyRotation()
 
 	db.closers.pub = z.NewCloser(1)
 	go db.pub.listenForUpdates(db.closers.pub)
@@ -495,6 +511,9 @@ func (db *DB) cleanup() {
 	db.stopMemoryFlush()
 	db.stopCompactions()
 
+	if db.closers.keyRotation != nil {
+		db.closers.keyRotation.Signal()
+	}
 	db.blockCache.Close()
 	db.indexCache.Close()
 	if db.closers.updateSize != nil {
@@ -572,6 +591,16 @@ func (db *DB) close() (err error) {
 		db.flushCond.Broadcast()
 	}
 	db.lock.Unlock()
+
+	// Stop the key rotation worker first. Its current batch may still be
+	// draining write-back requests through the write goroutine (stopped below)
+	// or rewriting a vlog file (serialized with value GC, stopped below), so
+	// stopping it first avoids waiting on goroutines we are about to tear
+	// down. The KEYROTATION checkpoint stays on disk when a rotation is
+	// interrupted here, so reopen resumes it from the same point.
+	if db.closers.keyRotation != nil {
+		db.closers.keyRotation.SignalAndWait()
+	}
 
 	if db.closers.valueGC != nil {
 		// Stop value GC first.
@@ -1800,9 +1829,13 @@ func (db *DB) DropAll() error {
 }
 
 func (db *DB) dropAll() (func(), error) {
+	// Stop the rotation worker before prepareToDrop() stops the write
+	// goroutine its vlog rewrites drain through.
+	rotationActive := db.pauseKeyRotationForDrop()
 	db.opt.Infof("DropAll called. Blocking writes...")
 	f, err := db.prepareToDrop()
 	if err != nil {
+		db.resumeKeyRotationAfterDrop(rotationActive)
 		return f, err
 	}
 	// prepareToDrop will stop all the incoming write and flushes any pending memtables.
@@ -1812,6 +1845,7 @@ func (db *DB) dropAll() (func(), error) {
 	resume := func() {
 		db.startCompactions()
 		f()
+		db.resumeKeyRotationAfterDrop(rotationActive)
 	}
 	// Block all foreign interactions with memory tables.
 	db.lock.Lock()
@@ -1862,11 +1896,14 @@ func (db *DB) DropPrefix(prefixes ...[]byte) error {
 		return nil
 	}
 	db.opt.Infof("DropPrefix called for %s", prefixes)
+	rotationActive := db.pauseKeyRotationForDrop()
 	f, err := db.prepareToDrop()
 	if err != nil {
+		db.resumeKeyRotationAfterDrop(rotationActive)
 		return err
 	}
 	defer f()
+	defer db.resumeKeyRotationAfterDrop(rotationActive)
 
 	var filtered [][]byte
 	if filtered, err = db.filterPrefixesToDrop(prefixes); err != nil {

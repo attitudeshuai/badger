@@ -477,6 +477,13 @@ type valueLog struct {
 
 	garbageCh    chan struct{}
 	discardStats *discardStats
+
+	// rolloverCh is used by online key rotation to ask the single write
+	// goroutine to seal the active value log file and create a fresh one
+	// (bootstrapped with the pinned, new data key) before its next write.
+	// Buffering of 1 plus an empty barrier request through writeCh makes the
+	// handoff synchronous with respect to user writes.
+	rolloverCh chan chan error
 }
 
 func vlogFilePath(dirPath string, fid uint32) string {
@@ -573,6 +580,7 @@ func (vlog *valueLog) init(db *DB) {
 	}
 
 	vlog.garbageCh = make(chan struct{}, 1) // Only allow one GC at a time.
+	vlog.rolloverCh = make(chan chan error, 1)
 	lf, err := InitDiscardStats(vlog.opt)
 	y.Check(err)
 	vlog.discardStats = lf
@@ -828,6 +836,31 @@ func (vlog *valueLog) write(reqs []*request) error {
 	maxFid := vlog.maxFid
 	curlf := vlog.filesMap[maxFid]
 	vlog.filesLock.RUnlock()
+
+	// Key rotation handoff. This runs on the single write goroutine, so no
+	// entry can be appended to the sealed file after this point. The fresh
+	// log file's bootstrap picks up the pinned (new generation) data key, and
+	// every subsequent write, including entries in this same batch, lands in
+	// the new file.
+	select {
+	case ack := <-vlog.rolloverCh:
+		rollErr := func() error {
+			if err := curlf.doneWriting(vlog.woffset()); err != nil {
+				return y.Wrapf(err, "while sealing value log %d for key rotation", curlf.fid)
+			}
+			newlf, err := vlog.createVlogFile()
+			if err != nil {
+				return y.Wrapf(err, "while creating value log for key rotation")
+			}
+			curlf = newlf
+			return nil
+		}()
+		ack <- rollErr
+		if rollErr != nil {
+			return rollErr
+		}
+	default:
+	}
 
 	defer func() {
 		if vlog.opt.SyncWrites {
@@ -1093,6 +1126,93 @@ func (vlog *valueLog) doRunGC(lf *logFile) error {
 	// Remove the file from discardStats.
 	vlog.discardStats.Update(lf.fid, -1)
 	return nil
+}
+
+// requestRollover seals the currently writable value log file and creates a
+// fresh one through the single write goroutine. It returns only after the
+// handoff is durable-in-progress, so all user writes that follow go to a file
+// bootstrapped with the pinned new-generation data key. It must be called
+// while key rotation starts, before the rotation state is persisted.
+func (vlog *valueLog) requestRollover() error {
+	ack := make(chan error, 1)
+	// rolloverCh has capacity 1 and only one rotation can run at a time.
+	vlog.rolloverCh <- ack
+
+	// Push an empty barrier request through the serial write path. The write
+	// goroutine performs the handoff while processing this batch.
+	req := requestPool.Get().(*request)
+	req.reset()
+	req.Wg.Add(1)
+	req.IncrRef() // for db write
+	vlog.db.writeCh <- req
+	werr := req.Wait()
+	rerr := <-ack
+	return y.CombineErrors(werr, rerr)
+}
+
+// pickRotationFile returns the oldest sealed value log file whose data key
+// generation differs from targetKeyID. The active (writable) file is never a
+// rotation candidate.
+func (vlog *valueLog) pickRotationFile(targetKeyID uint64) *logFile {
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+	for _, fid := range vlog.sortedFids() {
+		// Never touch the active log file; it was rolled over when rotation
+		// started (or created on reopen) and therefore already uses the target
+		// generation.
+		if fid >= vlog.maxFid {
+			continue
+		}
+		lf, ok := vlog.filesMap[fid]
+		y.AssertTrue(ok)
+		if lf.keyID() != targetKeyID {
+			return lf
+		}
+	}
+	return nil
+}
+
+// rotateRewriteOne rewrites one old-generation value log file. Live entries
+// are written back through the normal write path (so they land in a target
+// generation vlog and the LSM pointers are updated), and the old file is then
+// deleted with the same refcount rules as GC. It returns false when there is
+// nothing to do or another GC currently holds the single GC slot; the
+// rotation worker retries on the next batch.
+func (vlog *valueLog) rotateRewriteOne(targetKeyID uint64) (bool, error) {
+	lf := vlog.pickRotationFile(targetKeyID)
+	if lf == nil {
+		return false, nil
+	}
+	select {
+	case vlog.garbageCh <- struct{}{}:
+		// Acquired the GC slot.
+	default:
+		// A user-triggered GC is running; its output also lands under the
+		// pinned target generation. Retry on the next batch.
+		return false, nil
+	}
+	defer func() { <-vlog.garbageCh }()
+
+	vlog.opt.Infof("Key rotation rewriting value log fid: %d", lf.fid)
+	if err := vlog.rewrite(lf); err != nil {
+		return false, err
+	}
+	vlog.discardStats.Update(lf.fid, -1)
+	return true, nil
+}
+
+// rotationCounts reports total value log files and the number still encrypted
+// under a generation other than targetKeyID.
+func (vlog *valueLog) rotationCounts(targetKeyID uint64) (total, remaining int) {
+	vlog.filesLock.RLock()
+	defer vlog.filesLock.RUnlock()
+	for _, lf := range vlog.filesMap {
+		total++
+		if lf.keyID() != targetKeyID {
+			remaining++
+		}
+	}
+	return total, remaining
 }
 
 func (vlog *valueLog) waitOnGC(lc *z.Closer) {

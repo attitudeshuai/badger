@@ -29,6 +29,11 @@ type testOnlyOptions struct {
 	// that can occur in a DB instance. Currently, this is only used in
 	// testing activities.
 	syncChan chan string
+
+	// keyRotationSSTBatch overrides the number of SSTables rewritten per key
+	// rotation batch. Zero means use the default. Used by tests to force a
+	// fine-grained, interruptible batch schedule.
+	keyRotationSSTBatch int
 }
 
 // testOnlyDBExtensions specifies an extension to the type DB that we want to
