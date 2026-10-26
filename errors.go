@@ -96,6 +96,16 @@ var (
 	// ErrNilCallback is returned when subscriber's callback is nil.
 	ErrNilCallback = stderrors.New("Callback cannot be nil")
 
+	// ErrSubscriptionClosed is returned from Subscription.Wait when the
+	// subscription ends because the DB is closing. Any change not delivered
+	// (or not acknowledged within the configured DrainTimeout) is reported
+	// through Subscription.Undelivered.
+	ErrSubscriptionClosed = stderrors.New("Subscription closed because DB is closing")
+
+	// ErrInvalidSubscription is returned when subscription options are invalid
+	// (e.g. a bounded OverflowPolicy with a non-positive Capacity).
+	ErrInvalidSubscription = stderrors.New("Invalid subscription options")
+
 	// ErrEncryptionKeyMismatch is returned when the storage key is not
 	// matched with the key previously given.
 	ErrEncryptionKeyMismatch = stderrors.New("Encryption key mismatch")

@@ -255,6 +255,11 @@ type Txn struct {
 	discarded    bool
 	doneRead     bool
 	update       bool // update is used to conditionally keep track of reads.
+
+	// commitOrigin tags the resulting write request so the change feed can
+	// attribute changes. Zero value (OriginTxnCommit) is the default;
+	// WriteBatch sets OriginBatchCommit on its internal transactions.
+	commitOrigin changeOrigin
 }
 
 type pendingWritesIterator struct {
@@ -590,7 +595,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		entries = append(entries, e)
 	}
 
-	req, err := txn.db.sendToWriteCh(entries)
+	req, err := txn.db.sendToWriteChFrom(entries, txn.commitOrigin)
 	if err != nil {
 		orc.doneCommit(commitTs)
 		return nil, err

@@ -44,12 +44,22 @@ func (db *DB) NewWriteBatch() *WriteBatch {
 }
 
 func (db *DB) newWriteBatch(isManaged bool) *WriteBatch {
-	return &WriteBatch{
+	wb := &WriteBatch{
 		db:        db,
 		isManaged: isManaged,
-		txn:       db.newTransaction(true, isManaged),
 		throttle:  y.NewThrottle(16),
 	}
+	wb.txn = wb.newBatchTxn()
+	return wb
+}
+
+// newBatchTxn creates the internal transaction used by WriteBatch and tags
+// its commits with OriginBatchCommit so the change feed can attribute them.
+func (wb *WriteBatch) newBatchTxn() *Txn {
+	txn := wb.db.newTransaction(true, wb.isManaged)
+	txn.commitOrigin = OriginBatchCommit
+	txn.commitTs = wb.commitTs
+	return txn
 }
 
 // SetMaxPendingTxns sets a limit on maximum number of pending transactions while writing batches.
@@ -201,8 +211,7 @@ func (wb *WriteBatch) commit() error {
 		return err
 	}
 	wb.txn.CommitWith(wb.callback)
-	wb.txn = wb.db.newTransaction(true, wb.isManaged)
-	wb.txn.commitTs = wb.commitTs
+	wb.txn = wb.newBatchTxn()
 	return wb.Error()
 }
 

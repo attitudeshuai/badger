@@ -253,7 +253,11 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 			// Ensure length and size of wb is within transaction limits.
 			if int64(len(wb)+1) >= vlog.opt.maxBatchCount ||
 				size+es >= vlog.opt.maxBatchSize {
-				if err := vlog.db.batchSet(wb); err != nil {
+				// Tag the write-back as OriginRewrite so the change feed can
+				// distinguish GC re-deliveries (same key versions) from new
+				// commits. All three paths still funnel through the same
+				// writeRequests -> publisher delivery contract.
+				if err := vlog.db.batchSetFrom(wb, OriginRewrite); err != nil {
 					return err
 				}
 				size = 0
@@ -341,7 +345,7 @@ func (vlog *valueLog) rewrite(f *logFile) error {
 		if end > len(wb) {
 			end = len(wb)
 		}
-		if err := vlog.db.batchSet(wb[i:end]); err != nil {
+		if err := vlog.db.batchSetFrom(wb[i:end], OriginRewrite); err != nil {
 			if err == ErrTxnTooBig {
 				// Decrease the batch size to half.
 				batchSize = batchSize / 2
@@ -697,6 +701,10 @@ func (vlog *valueLog) sortedFids() []uint32 {
 type request struct {
 	// Input values
 	Entries []*Entry
+	// origin identifies which write path produced this request, so the
+	// change feed can tag the delivered changes (txn commit, WriteBatch,
+	// or background value-log rewrite).
+	origin changeOrigin
 	// Output values and wait group stuff below
 	Ptrs []valuePointer
 	Wg   sync.WaitGroup
@@ -706,6 +714,7 @@ type request struct {
 
 func (req *request) reset() {
 	req.Entries = req.Entries[:0]
+	req.origin = OriginTxnCommit
 	req.Ptrs = req.Ptrs[:0]
 	req.Wg = sync.WaitGroup{}
 	req.Err = nil

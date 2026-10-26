@@ -403,7 +403,8 @@ func Open(opt Options) (*DB, error) {
 	}
 
 	db.closers.pub = z.NewCloser(1)
-	go db.pub.listenForUpdates(db.closers.pub)
+	db.pub.closer = db.closers.pub
+	go db.pub.run(db.closers.pub)
 
 	valueDirLockGuard = nil
 	dirLockGuard = nil
@@ -914,6 +915,10 @@ func (db *DB) writeRequests(reqs []*request) error {
 }
 
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+	return db.sendToWriteChFrom(entries, OriginTxnCommit)
+}
+
+func (db *DB) sendToWriteChFrom(entries []*Entry, origin changeOrigin) (*request, error) {
 	if db.blockWrites.Load() == 1 {
 		return nil, ErrBlockedWrites
 	}
@@ -932,6 +937,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
+	req.origin = origin
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
 	db.writeCh <- req // Handled in doWrites.
@@ -1009,7 +1015,14 @@ func (db *DB) doWrites(lc *z.Closer) {
 //
 //	Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*Entry) error {
-	req, err := db.sendToWriteCh(entries)
+	return db.batchSetFrom(entries, OriginTxnCommit)
+}
+
+// batchSetFrom is batchSet with an explicit change origin. It is used by the
+// background value-log rewrite so the change feed can tag re-delivered
+// versions as OriginRewrite.
+func (db *DB) batchSetFrom(entries []*Entry, origin changeOrigin) error {
+	req, err := db.sendToWriteChFrom(entries, origin)
 	if err != nil {
 		return err
 	}
@@ -1994,66 +2007,50 @@ func (db *DB) Subscribe(ctx context.Context, cb func(kv *KVList) error, matches 
 		return ErrNilCallback
 	}
 
-	c := z.NewCloser(1)
-	s, err := db.pub.newSubscriber(c, matches)
-	if err != nil {
-		return y.Wrapf(err, "while creating a new subscriber")
-	}
-	slurp := func(batch *pb.KVList) error {
-		for {
-			select {
-			case kvs := <-s.sendCh:
-				batch.Kv = append(batch.Kv, kvs.Kv...)
-			default:
-				if len(batch.GetKv()) > 0 {
-					return cb(batch)
-				}
-				return nil
+	// The legacy callback API is implemented on top of the new delivery
+	// contract: Queue policy (never skip), automatic Ack after a successful
+	// callback, and a Change -> pb.KVList translation that preserves the
+	// exact key versions and field mapping of the old implementation
+	// (including re-delivered versions from value-log GC rewrites).
+	handler := func(sub *Subscription, batch *ChangeBatch) error {
+		if len(batch.Changes) > 0 {
+			kvs := &pb.KVList{Kv: make([]*pb.KV, 0, len(batch.Changes))}
+			for _, c := range batch.Changes {
+				kvs.Kv = append(kvs.Kv, &pb.KV{
+					Key:       c.Key,
+					Value:     c.Value,
+					Meta:      []byte{c.UserMeta},
+					ExpiresAt: c.ExpiresAt,
+					Version:   c.Version,
+				})
 			}
-		}
-	}
-
-	drain := func() {
-		for {
-			select {
-			case _, ok := <-s.sendCh:
-				if !ok {
-					// Channel is closed.
-					return
-				}
-			default:
-				return
-			}
-		}
-	}
-	for {
-		select {
-		case <-c.HasBeenClosed():
-			// No need to delete here. Closer will be called only while
-			// closing DB. Subscriber will be deleted by cleanSubscribers.
-			err := slurp(new(pb.KVList))
-			// Drain if any pending updates.
-			c.Done()
-			return err
-		case <-ctx.Done():
-			c.Done()
-			s.active.Store(0)
-			drain()
-			db.pub.deleteSubscriber(s.id)
-			// Delete the subscriber to avoid further updates.
-			return ctx.Err()
-		case batch := <-s.sendCh:
-			err := slurp(batch)
-			if err != nil {
-				c.Done()
-				s.active.Store(0)
-				drain()
-				// Delete the subscriber if there is an error by the callback.
-				db.pub.deleteSubscriber(s.id)
+			if err := cb(kvs); err != nil {
 				return err
 			}
 		}
+		// Automatic watermark confirmation after a successful callback.
+		sub.Ack(batch.Watermark)
+		return nil
 	}
+
+	sub, err := db.NewSubscription(SubscriptionOptions{
+		Matches: matches,
+		Policy:  OverflowQueue,
+		Context: ctx,
+	}, handler)
+	if err != nil {
+		return err
+	}
+
+	err = sub.Wait()
+	// A DB-close termination maps to the legacy behavior: the closer branch
+	// used to slurp remaining updates, invoke the callback once and return
+	// nil. All remaining items have just been delivered (or best-effort
+	// attempted) during the shutdown drain.
+	if errors.Is(err, ErrSubscriptionClosed) {
+		return nil
+	}
+	return err
 }
 
 func (db *DB) syncDir(dir string) error {
