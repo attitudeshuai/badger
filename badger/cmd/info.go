@@ -113,6 +113,14 @@ func handleInfo(cmd *cobra.Command, args []string) error {
 		return y.Wrap(err, "failed to print information in MANIFEST file")
 	}
 
+	// Bulk-ingest sessions are classified from their journals without opening
+	// the DB, so pending sessions are visible even when the DB cannot be opened.
+	ingestInfos, err := badger.ReadIngestSessions(bopt)
+	if err != nil {
+		return y.Wrap(err, "failed to read ingest sessions")
+	}
+	printIngestSessionList(ingestInfos)
+
 	// Open DB
 	db, err := badger.Open(bopt)
 	if err != nil {

@@ -129,6 +129,17 @@ type DB struct {
 	bannedNamespaces *lockedKeys
 	threshold        *vlogThreshold
 
+	// Bulk-ingest session bookkeeping. ingestLive holds journals attached to
+	// StreamWriters in this process (for on-disk DBs the files are the durable
+	// truth; this map also covers InMemory mode). ingestHistory remembers
+	// committed sessions (it is the only record of them in InMemory mode).
+	// Both are guarded by ingestMu, distinct from lock: session Begin blocks
+	// the write path and must not take db.lock in the same order as flush.
+	ingestMu      sync.Mutex
+	ingestLive    map[string]*ingestJournal
+	ingestHistory map[string]IngestSessionInfo
+	ingestWriters map[string]*StreamWriter
+
 	pub        *publisher
 	registry   *KeyRegistry
 	blockCache *ristretto.Cache[[]byte, *table.Block]
@@ -261,6 +272,9 @@ func Open(opt Options) (*DB, error) {
 		allocPool:        z.NewAllocatorPool(8),
 		bannedNamespaces: &lockedKeys{keys: make(map[uint64]struct{})},
 		threshold:        initVlogThreshold(&opt),
+		ingestLive:       make(map[string]*ingestJournal),
+		ingestHistory:    make(map[string]IngestSessionInfo),
+		ingestWriters:    make(map[string]*StreamWriter),
 	}
 
 	db.flushCond = sync.NewCond(&db.lock)
@@ -354,6 +368,14 @@ func Open(opt Options) (*DB, error) {
 	// newLevelsController potentially loads files in directory.
 	if db.lc, err = newLevelsController(db, &manifest); err != nil {
 		return db, err
+	}
+
+	// newLevelsController removed every SST not referenced by the MANIFEST
+	// (including staged ingest tables). Reconcile the surviving session
+	// journals: committing sessions whose final tables are present are finished
+	// off, everything else stays pending for an explicit Resume/Discard.
+	if err = db.recoverIngestSessions(); err != nil {
+		return db, y.Wrapf(err, "while recovering ingest sessions")
 	}
 
 	// Initialize vlog struct.
@@ -572,6 +594,12 @@ func (db *DB) close() (err error) {
 		db.flushCond.Broadcast()
 	}
 	db.lock.Unlock()
+
+	// Quiesce unfinished ingest sessions first: Begin blocked writes and
+	// stopped flushes/compactions; resume that quiescing here so the shutdown
+	// sequence below signals live closers exactly once. Staged files and
+	// session journals are deliberately preserved for reopen recovery.
+	db.quiesceIngestSessionsOnClose()
 
 	if db.closers.valueGC != nil {
 		// Stop value GC first.

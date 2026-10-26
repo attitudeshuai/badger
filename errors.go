@@ -114,4 +114,17 @@ var (
 
 	// ErrDBClosed is returned when a get operation is performed after closing the DB.
 	ErrDBClosed = stderrors.New("DB Closed")
+
+	// ErrIngestSessionNotFound is returned when resuming or discarding a
+	// bulk-ingest session whose journal does not exist on disk.
+	ErrIngestSessionNotFound = stderrors.New("ingest session not found")
+
+	// ErrIngestAlreadyCommitted is returned when an ingest session ID is reused
+	// after that session has already committed. Replaying a committed session
+	// is an idempotent no-op: no tables are created and no versions are added.
+	ErrIngestAlreadyCommitted = stderrors.New("ingest session already committed")
+
+	// ErrIngestSessionActive is returned when starting an ingest session while
+	// another unfinished session is still attached to the DB.
+	ErrIngestSessionActive = stderrors.New("another ingest session is in progress")
 )

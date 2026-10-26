@@ -38,6 +38,15 @@ type levelsController struct {
 	levels []*levelHandler
 	kv     *DB
 
+	// publishLock is the bulk-ingest publication barrier. Readers hold it in
+	// RLock mode while assembling their per-level table references (get and
+	// appendIterators); an ingest session commit holds the Lock while swapping
+	// table sets across levels. A reader therefore observes either the full
+	// pre-session state or the full converged state, never a mix. Only the
+	// ingest commit takes the write side, and compactions are stopped while an
+	// ingest session is active, so it never contends with background compaction.
+	publishLock sync.RWMutex
+
 	cstatus compactStatus
 }
 
@@ -1727,8 +1736,12 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 	// in opposite order, or in parallel (naively calling all the h.RLock() in some order) we could
 	// read level L's tables post-compaction and level L+1's tables pre-compaction. (If we do
 	// parallelize this, we will need to call the h.RLock() function by increasing order of level
-	// number.)
+	// number.) The publish barrier additionally guarantees that an ingest commit's cross-level
+	// swap can never be observed half applied: all per-level references below are acquired inside
+	// one RLock window that the commit takes exclusively.
 	version := y.ParseTs(key)
+	var getErr error
+	s.publishLock.RLock()
 	for _, h := range s.levels {
 		// Ignore all levels below startLevel. This is useful for GC when L0 is kept in memory.
 		if h.level < startLevel {
@@ -1736,18 +1749,24 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		}
 		vs, err := h.get(key) // Calls h.RLock() and h.RUnlock().
 		if err != nil {
-			return y.ValueStruct{}, y.Wrapf(err, "get key: %q", key)
+			getErr = y.Wrapf(err, "get key: %q", key)
+			break
 		}
 		if vs.Value == nil && vs.Meta == 0 {
 			continue
 		}
 		y.NumBytesReadsLSMAdd(s.kv.opt.MetricsEnabled, int64(len(vs.Value)))
 		if vs.Version == version {
+			s.publishLock.RUnlock()
 			return vs, nil
 		}
 		if maxVs.Version < vs.Version {
 			maxVs = vs
 		}
+	}
+	s.publishLock.RUnlock()
+	if getErr != nil {
+		return y.ValueStruct{}, getErr
 	}
 	if len(maxVs.Value) > 0 {
 		y.NumGetsWithResultsAdd(s.kv.opt.MetricsEnabled, 1)
@@ -1768,12 +1787,81 @@ func appendIteratorsReversed(out []y.Iterator, th []*table.Table, opt int) []y.I
 func (s *levelsController) appendIterators(
 	iters []y.Iterator, opt *IteratorOptions) []y.Iterator {
 	// Just like with get, it's important we iterate the levels from 0 on upward, to avoid missing
-	// data when there's a compaction.
+	// data when there's a compaction. Assembling the iterators under the publish barrier makes an
+	// ingest commit's multi-level table swap atomic w.r.t. each iterator snapshot.
+	s.publishLock.RLock()
+	defer s.publishLock.RUnlock()
 	for _, level := range s.levels {
 		iters = level.appendIterators(iters, opt)
 	}
 	return iters
 }
+
+// publishIngest atomically replaces level table sets for an ingest commit.
+// adds[level] are new tables to install (caller holds the builder refs; this
+// function IncrRefs them on the level), dels[level] are older tables to remove
+// (caller has previously IncrRefd them; their extra refs are DecrRefd here,
+// after the swap, which unlinks their files once the MANIFEST DELETE landed).
+//
+// The whole multi-level swap happens while holding publishLock exclusively, so
+// no reader can assemble a snapshot that mixes the old and the converged sets.
+func (s *levelsController) publishIngest(adds, dels map[int][]*table.Table) error {
+	s.publishLock.Lock()
+	defer s.publishLock.Unlock()
+
+	levelSet := make(map[int]struct{})
+	for l := range adds {
+		levelSet[l] = struct{}{}
+	}
+	for l := range dels {
+		levelSet[l] = struct{}{}
+	}
+
+	levels := make([]int, 0, len(levelSet))
+	for l := range levelSet {
+		levels = append(levels, l)
+	}
+	sort.Ints(levels)
+
+	var toDecr []*table.Table
+	for _, l := range levels {
+		h := s.levels[l]
+		h.Lock()
+
+		delMap := make(map[uint64]struct{})
+		for _, t := range dels[l] {
+			delMap[t.ID()] = struct{}{}
+		}
+		newTables := make([]*table.Table, 0, len(h.tables)+len(adds[l]))
+		for _, t := range h.tables {
+			if _, removed := delMap[t.ID()]; removed {
+				h.subtractSize(t)
+				continue
+			}
+			newTables = append(newTables, t)
+		}
+		for _, t := range adds[l] {
+			h.addSize(t)
+			t.IncrRef()
+			newTables = append(newTables, t)
+		}
+		h.tables = newTables
+
+		h.Unlock() // Unlock before DecrRef, matching replaceTables.
+		toDecr = append(toDecr, dels[l]...)
+	}
+	// Test checkpoint: invoked while the publish barrier is held exclusively,
+	// with the new table sets already installed. Nil in production.
+	if testingIngestPublishHook != nil {
+		testingIngestPublishHook()
+	}
+	return decrRefs(toDecr)
+}
+
+// testingIngestPublishHook is used by ingest session tests to enlarge the
+// commit publication window and verify read atomicity. Must stay nil outside
+// tests.
+var testingIngestPublishHook func()
 
 // TableInfo represents the information about a table.
 type TableInfo struct {
